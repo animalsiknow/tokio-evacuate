@@ -17,6 +17,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 //! `tokio-evacuate` provides a way to safely "evacuate" users of a resource before forcefully
 //! removing them.
 //!
@@ -31,34 +32,33 @@
 //! complete, before forcefully stopping computation.
 //!
 //! `tokio-evacuate` depends on Tokio facilities, and so will not work on other futures executors.
-#[macro_use]
-extern crate futures;
-extern crate parking_lot;
-extern crate slab;
-extern crate tokio_executor;
-extern crate tokio_sync;
-extern crate tokio_timer;
 
-use futures::{future::Fuse, prelude::*};
+use futures::{
+    future::{Fuse, FusedFuture, FutureExt},
+    ready,
+};
 use parking_lot::Mutex;
 use slab::Slab;
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio_executor::{DefaultExecutor, Executor, SpawnError};
-use tokio_sync::task::AtomicTask;
-use tokio_timer::{clock::now as clock_now, Delay};
+use tokio_sync::AtomicWaker;
+use tokio_timer::{clock::now as clock_now, delay, Delay};
 
 #[derive(Default)]
 struct Inner {
     count: AtomicUsize,
     finished: AtomicBool,
-    notifier: AtomicTask,
-    waiters: Mutex<Slab<Arc<AtomicTask>>>,
+    notifier: AtomicWaker,
+    waiters: Mutex<Slab<Arc<AtomicWaker>>>,
 }
 
 /// Dispatcher for user count updates.
@@ -83,7 +83,7 @@ pub struct Warden {
 /// [`Evacuate`] can be cloned, and all clones will become ready at the same time.
 pub struct Evacuate {
     state: Arc<Inner>,
-    task: Arc<AtomicTask>,
+    waker: Arc<AtomicWaker>,
     waiter_id: usize,
 }
 
@@ -101,11 +101,11 @@ impl Inner {
 
     pub fn decrement(&self) {
         if self.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.notifier.notify();
+            self.notifier.wake();
         }
     }
 
-    pub fn register(&self, waiter: Arc<AtomicTask>) -> usize {
+    pub fn register(&self, waiter: Arc<AtomicWaker>) -> usize {
         let mut waiters = self.waiters.lock();
         waiters.insert(waiter)
     }
@@ -115,12 +115,12 @@ impl Inner {
         let _ = waiters.remove(waiter_id);
     }
 
-    pub fn notify(&self) {
+    pub fn wake(&self) {
         self.finished.store(true, Ordering::SeqCst);
 
         let waiters = self.waiters.lock();
         for waiter in waiters.iter() {
-            waiter.1.notify();
+            waiter.1.wake();
         }
     }
 }
@@ -139,41 +139,53 @@ impl<F: Future> Runner<F> {
             state,
             tripwire: tripwire.fuse(),
             timeout_ms,
-            timeout: Delay::new(clock_now()),
+            timeout: delay(clock_now()),
         }
+    }
+
+    fn tripwire(self: Pin<&mut Self>) -> Pin<&mut Fuse<F>> {
+        // Safety: self.tripwire is never moved.
+        unsafe { self.map_unchecked_mut(|runner| &mut runner.tripwire) }
+    }
+
+    fn timeout(self: Pin<&mut Self>) -> &mut Delay {
+        // Safety: self.timeout is not structurally pinned.
+        unsafe { &mut self.get_unchecked_mut().timeout }
     }
 }
 
 impl<F: Future> Future for Runner<F> {
-    type Error = ();
-    type Item = ();
+    type Output = ();
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.state.notifier.register();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        self.state.notifier.register(cx.waker().clone());
 
         // We have to wait for our tripwire.
-        if !self.tripwire.is_done() {
-            let _ = try_ready!(self.tripwire.poll().map_err(|_| ()));
+        if !self.as_mut().tripwire().is_terminated() {
+            let _ = ready!(self.as_mut().tripwire().poll(cx));
 
             // If we're here, reset our delay based on the timeout.
-            self.timeout.reset(clock_now() + Duration::from_millis(self.timeout_ms));
+            let timeout_ms = self.timeout_ms;
+            self.as_mut()
+                .timeout()
+                .reset(clock_now() + Duration::from_millis(timeout_ms));
         }
 
         // We've tripped, so let's see what we're at for count.  If we're at zero, then we're done,
         // otherwise, fall through and see if we've hit our delay yet.
         if self.state.count.load(Ordering::SeqCst) == 0 {
             // We've tripped and we're at count 0, so we're done.  Notify waiters.
-            self.state.notify();
-            return Ok(Async::Ready(()));
+            self.state.wake();
+            return Poll::Ready(());
         }
 
         // Our count isn't at zero, but let's see if we've timed out yet.
-        try_ready!(self.timeout.poll().map_err(|_| ()));
+        ready!(self.as_mut().timeout().poll_unpin(cx));
 
         // We timed out, so mark ourselves finished and notify.
-        self.state.notify();
+        self.state.wake();
 
-        Ok(Async::Ready(()))
+        Poll::Ready(())
     }
 }
 
@@ -195,12 +207,12 @@ impl Evacuate {
         let state = Inner::new();
         let warden = Warden { state: state.clone() };
 
-        let task = Arc::new(AtomicTask::new());
+        let task = Arc::new(AtomicWaker::new());
         let waiter_id = state.register(task.clone());
 
         let evacuate = Evacuate {
             state: state.clone(),
-            task,
+            waker: task,
             waiter_id,
         };
 
@@ -220,12 +232,13 @@ impl Evacuate {
     /// machine powering [`Evacuate`].  This function must be called from within a running task.
     pub fn default_executor<F>(tripwire: F, timeout_ms: u64) -> Result<(Warden, Evacuate), SpawnError>
     where
-        F: Future + Send + 'static,
+        F: Future + Send + Sized + 'static,
     {
         let (warden, evacuate, runner) = Self::new(tripwire, timeout_ms);
+        let runner: Box<dyn Future<Output = ()> + Send> = Box::new(runner);
 
         DefaultExecutor::current()
-            .spawn(Box::new(runner))
+            .spawn(runner.into())
             .map(move |_| (warden, evacuate))
     }
 }
@@ -237,109 +250,130 @@ impl Drop for Evacuate {
 impl Clone for Evacuate {
     fn clone(&self) -> Self {
         let state = self.state.clone();
-        let task = Arc::new(AtomicTask::new());
+        let task = Arc::new(AtomicWaker::new());
         let waiter_id = state.register(task.clone());
 
-        Evacuate { state, task, waiter_id }
+        Evacuate {
+            state,
+            waker: task,
+            waiter_id,
+        }
     }
 }
 
 impl Future for Evacuate {
-    type Error = ();
-    type Item = ();
+    type Output = ();
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.task.register();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        self.waker.register(cx.waker().clone());
 
         if !self.state.finished.load(Ordering::SeqCst) {
-            Ok(Async::NotReady)
+            Poll::Pending
         } else {
-            Ok(Async::Ready(()))
+            Poll::Ready(())
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #[macro_use]
-    mod support;
-    use self::support::*;
-
     use super::Evacuate;
 
     use futures::{
-        future::{empty, ok},
-        Future,
+        future::{pending, ready},
+        pin_mut,
+        task::Context,
     };
+    use std::{future::Future, time::Duration};
+    use tokio_test::{self, assert_pending, assert_ready, clock, task};
+
+    fn mock(f: impl Fn(&mut clock::Handle, &mut Context)) {
+        task::mock(|cx| {
+            clock::mock(|cl| f(cl, cx));
+        });
+    }
 
     #[test]
     fn test_evacuate_stops_at_tripwire() {
-        mocked(|_, _| {
-            let tripwire = empty::<(), ()>();
-            let (_warden, mut evacuate, _runner) = Evacuate::new(tripwire, 10000);
-            assert_not_ready!(evacuate);
+        mock(|_, cx| {
+            let tripwire = pending::<()>();
+            let (_warden, evacuate, _runner) = Evacuate::new(tripwire, 10000);
+            pin_mut!(evacuate);
+
+            assert_pending!(evacuate.as_mut().poll(cx));
         });
     }
 
     #[test]
     fn test_evacuate_falls_through_on_tripwire() {
-        mocked(|_, _| {
-            let tripwire = ok::<(), ()>(());
-            let (_warden, mut evacuate, mut runner) = Evacuate::new(tripwire, 10000);
-            assert_not_ready!(evacuate);
-            assert_ready!(runner);
-            assert_ready!(evacuate);
+        mock(|_, cx| {
+            let tripwire = ready(());
+            let (_warden, evacuate, runner) = Evacuate::new(tripwire, 10000);
+            pin_mut!(evacuate);
+            pin_mut!(runner);
+
+            assert_pending!(evacuate.as_mut().poll(cx));
+            assert_ready!(runner.as_mut().poll(cx));
+            assert_ready!(evacuate.as_mut().poll(cx));
         });
     }
 
     #[test]
     fn test_evacuate_stops_after_tripping_with_clients() {
-        mocked(|_, _| {
-            let tripwire = ok::<(), ()>(());
-            let (warden, mut evacuate, mut runner) = Evacuate::new(tripwire, 10000);
-            assert_not_ready!(evacuate);
-            warden.increment();
+        mock(|_, cx| {
+            let tripwire = ready(());
+            let (warden, evacuate, runner) = Evacuate::new(tripwire, 10000);
+            pin_mut!(evacuate);
+            pin_mut!(runner);
 
-            assert_not_ready!(runner);
-            assert_not_ready!(evacuate);
+            assert_pending!(evacuate.as_mut().poll(cx));
+            warden.increment();
+            assert_pending!(runner.as_mut().poll(cx));
+            assert_pending!(evacuate.as_mut().poll(cx));
         });
     }
 
     #[test]
     fn test_evacuate_completes_after_client_count_ping_pong() {
-        mocked(|_, _| {
-            let tripwire = ok::<(), ()>(());
-            let (warden, mut evacuate, mut runner) = Evacuate::new(tripwire, 10000);
+        mock(|_, cx| {
+            let tripwire = ready(());
+            let (warden, evacuate, runner) = Evacuate::new(tripwire, 10000);
+            pin_mut!(evacuate);
+            pin_mut!(runner);
+
             warden.increment();
-            assert_not_ready!(runner);
-            assert_not_ready!(evacuate);
+            assert_pending!(runner.as_mut().poll(cx));
+            assert_pending!(evacuate.as_mut().poll(cx));
             warden.increment();
-            assert_not_ready!(runner);
-            assert_not_ready!(evacuate);
+            assert_pending!(runner.as_mut().poll(cx));
+            assert_pending!(evacuate.as_mut().poll(cx));
             warden.decrement();
             warden.decrement();
-            assert_ready!(runner);
-            assert_ready!(evacuate);
+            assert_ready!(runner.as_mut().poll(cx));
+            assert_ready!(evacuate.as_mut().poll(cx));
         });
     }
 
     #[test]
     fn test_evacuate_delay_before_clients_hit_zero() {
-        mocked(|timer, _| {
-            let tripwire = ok::<(), ()>(());
-            let (warden, mut evacuate, mut runner) = Evacuate::new(tripwire, 10000);
+        mock(|cl, cx| {
+            let tripwire = ready(());
+            let (warden, evacuate, runner) = Evacuate::new(tripwire, 10000);
+            pin_mut!(evacuate);
+            pin_mut!(runner);
+
             warden.increment();
-            assert_not_ready!(runner);
-            assert_not_ready!(evacuate);
+            assert_pending!(runner.as_mut().poll(cx));
+            assert_pending!(evacuate.as_mut().poll(cx));
             warden.increment();
-            assert_not_ready!(runner);
-            assert_not_ready!(evacuate);
+            assert_pending!(runner.as_mut().poll(cx));
+            assert_pending!(evacuate.as_mut().poll(cx));
             warden.decrement();
-            assert_not_ready!(runner);
-            assert_not_ready!(evacuate);
-            advance(timer, ms(10001));
-            assert_ready!(runner);
-            assert_ready!(evacuate);
+            assert_pending!(runner.as_mut().poll(cx));
+            assert_pending!(evacuate.as_mut().poll(cx));
+            cl.advance(Duration::from_millis(10001));
+            assert_ready!(runner.as_mut().poll(cx));
+            assert_ready!(evacuate.as_mut().poll(cx));
         });
     }
 }
